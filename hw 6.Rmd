@@ -1,0 +1,233 @@
+
+# Question 1
+```{r}
+library(dplyr)
+library(broom)
+library(forcats)
+library(purrr)
+library(tidyr)
+library(ggplot2)
+library(modelr)
+library(yardstick)
+library(rsample)
+
+data = read.csv("homicide-data.csv")
+
+# Data cleansing
+data$city_state <- paste(data$city, data$state, sep = ", ")
+
+unique(data$disposition)
+
+data <- data %>%
+  filter(!(city_state %in% c("Dallas, TX", "Phoenix, AZ", "Kansas City, MO", "Tulsa, AL"))) %>% 
+  filter(victim_race %in% c("White", "Black")) %>%
+  mutate(victim_age = as.numeric(victim_age)) %>%
+  mutate(solved = ifelse(disposition == "Closed by arrest", 1, 0))
+
+data = na.omit(data)
+
+# glm model for Baltimore, MD
+baltimore_data <- data %>% 
+  filter(city_state == "Baltimore, MD")
+
+fit_logistic <- glm(solved ~ victim_age + victim_sex + victim_race, 
+             data = baltimore_data, 
+             family = binomial())
+
+results <- fit_logistic |> 
+  broom::tidy(conf.int = TRUE) |> 
+  mutate(OR = exp(estimate),
+         lower = exp(conf.low),
+         upper = exp(conf.high)) 
+
+male_OR <- results |> 
+  filter(term == "victim_sexMale") |> 
+  select(term, log_OR = estimate, OR, CI_lower = lower, CI_upper = upper, p.value) 
+
+male_OR |> 
+  knitr::kable(digits = 3)
+
+# glm for each city
+nest_lm_res_with_CI = 
+  data |> 
+  nest(data = -city_state) |> 
+  mutate(
+    models = map(data, \(df) glm(solved ~ victim_age + victim_sex + victim_race, data = df, family = binomial())),
+    results = map(models, ~broom::tidy(.x, conf.int = TRUE))) |> 
+  select(-data, -models) |> 
+  unnest(results)
+
+OR_and_CI = 
+  nest_lm_res_with_CI |> 
+  filter(term == "victim_sexMale") |> 
+  mutate(OR = exp(estimate),
+         CI_lower = exp(conf.low),
+         CI_upper = exp(conf.high)) |> 
+  select(city_state, term, OR, CI_lower, CI_upper)
+
+OR_and_CI |> 
+  knitr::kable(digits = 3)
+```
+
+According to the plot, it seems like male in Albuquerque are way more likely to commit homicide compared to female. In contrast, New York seem to have similar ratios between male and female. 
+```{r}
+# plot
+ggplot(OR_and_CI, aes(x = OR, y = reorder(city_state, OR))) +
+  geom_point(shape = 21, fill = "white", size = 3) +
+  geom_errorbarh(aes(xmin = CI_lower, xmax = CI_upper), height = 0.2) +
+  geom_vline(xintercept = 1, linetype = "dashed") +
+  scale_x_log10(breaks = scales::trans_breaks("log10", function(x) 10^x),
+                labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  theme_minimal() +
+  labs(x = "Odds Ratio (95% CI)", y = "City") +
+  theme(axis.text.y = element_text(size = 8))
+```
+
+# Question 2
+```{r}
+library(rnoaa)
+weather_df = 
+  rnoaa::meteo_pull_monitors(
+    c("USW00094728"),
+    var = c("PRCP", "TMIN", "TMAX"), 
+    date_min = "2022-01-01",
+    date_max = "2022-12-31") |>
+  mutate(
+    name = recode(id, USW00094728 = "CentralPark_NY"),
+    tmin = tmin / 10,
+    tmax = tmax / 10) |>
+  select(name, id, everything())
+
+# bootstrap + plot
+bootstrap_results <- weather_df |> 
+  modelr::bootstrap(n = 5000) |> 
+  mutate(
+    models = map(strap, \(df) lm(tmax ~ tmin + prcp, data = df)),
+    r_squared = map_dbl(models, \(model) broom::glance(model)$r.squared),
+    beta_product = map_dbl(models, \(model) prod(coef(model)[-1])))
+```
+
+The distribution of R-squared Estimates seem to be approxmiately normal with a slight skew to the left. Distribution of log(Beta0 * Beta1) Estimates seems to have two tops and a slight skew to the right. 
+```{r}
+# plots
+ggplot(bootstrap_results, aes(x = r_squared)) +
+  geom_density() +
+  labs(title = "Distribution of R-squared Estimates")
+
+ggplot(bootstrap_results, aes(x = beta_product)) +
+  geom_density() +
+  labs(title = "Distribution of log(Beta0 * Beta1) Estimates")
+
+
+r_squared_ci <- quantile(bootstrap_results$r_squared, c(0.025, 0.975))
+beta_product_ci <- quantile(bootstrap_results$beta_product, c(0.025, 0.975))
+
+print(paste("95% CI for R-squared:", r_squared_ci))
+print(paste("95% CI for log(Beta0 * Beta1):", beta_product_ci))
+
+```
+
+# Question 3: 
+I started a proposed linear regression model using all variables to understand the big picture of the data and the variables associated with birthweight. The residual plot shows a clustered residual and non-linear trend. This can indicate that the model does not fit very well. And then I used forward selection to select an optimal model and plotted. However, result seem similar. 
+```{r}
+birthweight = read.csv("birthweight.csv")
+# cleanse
+birthweight <- birthweight %>%
+  mutate(
+    babysex = as.factor(babysex),
+    frace = as.factor(frace),
+    malform = as.factor(malform),
+    mrace = as.factor(mrace)
+  )
+birthweight <- na.omit(birthweight)
+
+# model 1
+model <- lm(bwt ~ babysex + bhead + blength + delwt + fincome + frace +
+            gaweeks + malform + menarche + mheight + momage + mrace +
+            parity + pnumlbw + pnumsga + ppbmi + ppwt + smoken + wtgain,
+            data = birthweight)
+# forward selection
+start_mod = lm(bwt~1,data=birthweight)
+empty_mod = lm(bwt~1,data=birthweight)
+full_mod = lm(bwt~.,data=birthweight)
+forwardStepwise = step(start_mod,
+                       scope=list(upper=full_mod,lower=empty_mod),
+                       direction='forward')
+model2 = lm(bwt ~ bhead + blength + mrace + delwt + gaweeks + smoken + ppbmi + 
+    babysex + parity + ppwt + fincome, data= birthweight)
+
+model_predictions <- augment(model, add_predictions = TRUE, add_residuals = TRUE)
+
+#plot
+fitted_vs_residuals <- model_predictions %>%
+  ggplot(aes(x = .fitted, y = .resid)) +
+  geom_point() +
+  geom_smooth(method = "loess", se = FALSE, color = "red") +
+  labs(title = "Residuals vs Fitted Values",
+       x = "Fitted Values",
+       y = "Residuals")
+print(fitted_vs_residuals)
+
+model_predictions <- augment(model2, add_predictions = TRUE, add_residuals = TRUE)
+
+#plot
+fitted_vs_residuals <- model_predictions %>%
+  ggplot(aes(x = .fitted, y = .resid)) +
+  geom_point() +
+  geom_smooth(method = "loess", se = FALSE, color = "red") +
+  labs(title = "Residuals vs Fitted Values",
+       x = "Fitted Values",
+       y = "Residuals")
+print(fitted_vs_residuals)
+
+# model 3
+model_length_gestational <- lm(bwt ~ blength + gaweeks, data = birthweight)
+summary(model_length_gestational)
+
+# model 4
+model_interactions <- lm(bwt ~ bhead * blength * babysex, data = birthweight)
+summary(model_interactions)
+```
+
+Looking at RMSE, it seems like the first model has the lowest RMSE out of the three. 
+```{r}
+compute_rmse <- function(model, data) {
+  preds <- predict(model, newdata = data)
+  sqrt(mean((data$bwt - preds)^2))
+}
+
+cv_df <- crossv_mc(birthweight, 100) |> 
+  mutate(
+    train = map(train, as_tibble),
+    test = map(test, as_tibble)) |> 
+  mutate(
+    model_1 = map(train, \(df) lm(bwt ~ bhead + blength + mrace + delwt + gaweeks + smoken + ppbmi + 
+      babysex + parity + ppwt + fincome, data = df)),
+    model_2 = map(train, \(df) lm(bwt ~ blength + gaweeks, data = df)),
+    model_3 = map(train, \(df) lm(bwt ~ bhead * blength * babysex, data = df))) |> 
+  mutate(
+    rmse_1 = map2_dbl(model_1, test, compute_rmse),
+    rmse_2 = map2_dbl(model_2, test, compute_rmse),
+    rmse_3 = map2_dbl(model_3, test, compute_rmse))
+
+rmse_df <- cv_df |> 
+  select(starts_with("rmse")) |> 
+  pivot_longer(
+    everything(),
+    names_to = "model", 
+    values_to = "rmse",
+    names_prefix = "rmse_") |> 
+  mutate(model = fct_inorder(model))
+
+# plot
+ggplot(rmse_df, aes(x = model, y = rmse)) + 
+  geom_violin() + 
+  theme_minimal() +
+  labs(x = "Model", y = "RMSE")
+```
+
+
+
+
+
+
